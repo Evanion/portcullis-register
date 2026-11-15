@@ -6,8 +6,8 @@ description: >-
   object its access policy's subject and object shapes. The calling
   job needs `permissions: id-token: write` to authenticate with GitHub OIDC.
 inputs:
-  realm:
-    description: Realm slug
+  org:
+    description: Organization slug
     required: true
   project:
     description: Project slug

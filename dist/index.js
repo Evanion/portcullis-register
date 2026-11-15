@@ -40,9 +40,15 @@ function errorCode(body) {
   const e = body["error"];
   return typeof e === "string" && /^[A-Za-z0-9_.:-]{1,64}$/.test(e) ? e : void 0;
 }
+var HINTS = {
+  project_required: "this repository is linked to projects in the organization; name one with --project or the action input project"
+};
 function refusal(label, status, body) {
   const code = errorCode(body);
-  return new ApiError(`${label}: ${status}${code ? ` ${code}` : ""}`);
+  const hint = code ? HINTS[code] : void 0;
+  return new ApiError(
+    `${label}: ${status}${code ? ` ${code}` : ""}${hint ? ` (${hint})` : ""}`
+  );
 }
 
 // apps/cli/src/auth.ts
@@ -78,9 +84,10 @@ async function tokenFor(env, scope, apiBase, fetchFn = fetch) {
         authorization: `Bearer ${jwt}`,
         "content-type": "application/json"
       },
-      // An empty env asks for a realm-wide exchange: project and env come together or not at all.
+      // An empty env with a project asks for a project-only exchange (a
+      // branch close without a base); with neither, an org-wide one.
       body: JSON.stringify(
-        scope.env ? { realm: scope.realm, project: scope.project, env: scope.env } : { realm: scope.realm }
+        scope.env ? { org: scope.org, project: scope.project, env: scope.env } : scope.project ? { org: scope.org, project: scope.project } : { org: scope.org }
       )
     }
   );
@@ -115,7 +122,7 @@ function parseArgs(argv) {
       args: argv,
       allowPositionals: true,
       options: {
-        realm: { type: "string" },
+        org: { type: "string" },
         project: { type: "string" },
         env: { type: "string" },
         source: { type: "string" },
@@ -131,7 +138,7 @@ function parseArgs(argv) {
     throw new UsageError(`unexpected argument "${positionals[1]}"`);
   }
   const v = parsed.values;
-  for (const name of ["realm", "project", "env", "source"]) {
+  for (const name of ["org", "project", "env", "source"]) {
     if (!v[name]) throw new UsageError(`missing --${name}`);
   }
   if (!SOURCE.test(v.source)) {
@@ -148,7 +155,7 @@ function parseArgs(argv) {
   return {
     file: positionals[0] ?? "portcullis.json",
     api,
-    realm: v.realm,
+    org: v.org,
     project: v.project,
     env: v.env,
     source: v.source
@@ -236,7 +243,71 @@ function readFlagFile(path) {
   }
   const acl = doc.acl;
   if (acl !== void 0) out.acl = readAcl(acl, bad);
+  const entitlements = doc.entitlements;
+  if (entitlements !== void 0)
+    out.entitlements = readEntitlements(entitlements, bad);
   return out;
+}
+var FEATURE_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+var FEATURE_KINDS = ["boolean", "limit", "metered"];
+var RESETS = ["period", "month", "never"];
+function readEntitlements(value, bad) {
+  if (!isObject(value)) throw bad("entitlements", "must be an object");
+  for (const key of Object.keys(value))
+    if (key !== "features")
+      throw bad(
+        `entitlements.${key}`,
+        key === "plans" ? "plans are never declared in code; edit them in the console, where they are reviewed" : "unknown member"
+      );
+  const features = value["features"];
+  if (!Array.isArray(features))
+    throw bad("entitlements.features", "must be an array");
+  const seen = /* @__PURE__ */ new Set();
+  return {
+    features: features.map((raw, i) => {
+      const at = `entitlements.features[${i}]`;
+      if (!isObject(raw)) throw bad(at, "must be an object");
+      for (const member of Object.keys(raw))
+        if (!["key", "kind", "unit", "gauge", "reset", "description"].includes(
+          member
+        ))
+          throw bad(`${at}.${member}`, "unknown member");
+      const { key, kind, unit, gauge, reset, description } = raw;
+      if (typeof key !== "string" || !FEATURE_KEY.test(key))
+        throw bad(`${at}.key`, "must be a flag key");
+      if (seen.has(key)) throw bad(`${at}.key`, `duplicate "${key}"`);
+      seen.add(key);
+      if (typeof kind !== "string" || !FEATURE_KINDS.includes(kind))
+        throw bad(`${at}.kind`, `must be one of ${FEATURE_KINDS.join(", ")}`);
+      const out = {
+        key,
+        kind
+      };
+      if (kind !== "boolean") {
+        if (typeof unit !== "string" || unit === "")
+          throw bad(`${at}.unit`, "must be a non-empty string");
+        out.unit = unit;
+      } else if (unit !== void 0)
+        throw bad(`${at}.unit`, "only for limit and metered");
+      if (gauge !== void 0) {
+        if (kind !== "limit" || typeof gauge !== "boolean")
+          throw bad(`${at}.gauge`, "a boolean, only for limit");
+        out.gauge = gauge;
+      }
+      if (kind === "metered") {
+        if (typeof reset !== "string" || !RESETS.includes(reset))
+          throw bad(`${at}.reset`, `must be one of ${RESETS.join(", ")}`);
+        out.reset = reset;
+      } else if (reset !== void 0)
+        throw bad(`${at}.reset`, "only for metered");
+      if (description !== void 0) {
+        if (typeof description !== "string")
+          throw bad(`${at}.description`, "must be a string");
+        out.description = description;
+      }
+      return out;
+    })
+  };
 }
 var isObject = (v) => !!v && typeof v === "object" && !Array.isArray(v);
 function readShape(value, at, bad) {
@@ -294,8 +365,8 @@ function readAcl(acl, bad) {
   return out;
 }
 async function register(apiBase, scope, source, declared, token, fetchFn = fetch) {
-  const { realm, project, env } = scope;
-  const url = `${apiBase.replace(/\/+$/, "")}/v1/realms/${encodeURIComponent(realm)}/projects/${encodeURIComponent(project)}/environments/${encodeURIComponent(env)}/documents/feature/register`;
+  const { org, project, env } = scope;
+  const url = `${apiBase.replace(/\/+$/, "")}/v1/orgs/${encodeURIComponent(org)}/projects/${encodeURIComponent(project)}/environments/${encodeURIComponent(env)}/documents/feature/register`;
   const res = await call(fetchFn, "register", url, {
     method: "POST",
     headers: {
@@ -320,9 +391,10 @@ function summary(scope, r) {
   const context = r.context?.changed ? `; context released to ${r.context.released.length} environments${skipped}` : skipped ? `; context${skipped.slice(1)}` : "";
   const aclSkipped = r.acl?.skipped.length ? `, skipped ${r.acl.skipped.map((s) => `${s.env} (${s.reason})`).join(", ")}` : "";
   const acl = r.acl?.changed ? `; access schema released to ${r.acl.released.length} environments${aclSkipped}` : aclSkipped ? `; access schema${aclSkipped.slice(1)}` : "";
+  const entitlements = r.entitlements?.added.length ? `; ${r.entitlements.added.length} entitlement features added to the catalog` : "";
   const warnings = (r.warnings ?? []).map((w) => `
 warning: ${w.message}`);
-  return flags + context + acl + warnings.join("");
+  return flags + context + acl + entitlements + warnings.join("");
 }
 async function run(argv, env, fetchFn = fetch) {
   try {
@@ -355,7 +427,7 @@ function runAction(env, fetchFn = fetch) {
     "--api",
     input("API") || DEFAULT_API
   ];
-  for (const name of ["realm", "project", "env", "source"]) {
+  for (const name of ["org", "project", "env", "source"]) {
     const value = input(name.toUpperCase());
     if (value) argv.push(`--${name}`, value);
   }
